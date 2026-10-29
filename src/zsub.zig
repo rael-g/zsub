@@ -30,6 +30,35 @@ pub fn inOrder(slots: anytype) VerificationError!void {
     }
 }
 
+/// A matcher accepting the calls whose argument `k` equals `value`, for `with` and `where`.
+pub fn argIs(comptime k: usize, comptime value: anytype) type {
+    return struct {
+        pub fn matches(args: anytype) bool {
+            return std.meta.eql(args[k], value);
+        }
+    };
+}
+
+/// A matcher accepting the calls whose argument `k` differs from `value`, for `with` and `where`.
+pub fn argIsNot(comptime k: usize, comptime value: anytype) type {
+    return struct {
+        pub fn matches(args: anytype) bool {
+            return !std.meta.eql(args[k], value);
+        }
+    };
+}
+
+fn predicate(comptime Args: type, comptime matcher: anytype) *const fn (Args) bool {
+    if (@TypeOf(matcher) == type) {
+        return &struct {
+            fn f(args: Args) bool {
+                return matcher.matches(args);
+            }
+        }.f;
+    }
+    return matcher;
+}
+
 /// A substitute of `T` with the default capacity.
 pub fn For(comptime T: type) type {
     return ForN(T, default_capacity);
@@ -236,9 +265,10 @@ pub fn When(comptime F: type) type {
         state: *SlotState(F),
         predicate: ?*const fn (Args) bool,
 
-        /// Narrows what follows to the calls whose arguments `matches` accepts.
-        pub fn with(self: Self, matches: *const fn (Args) bool) Self {
-            return .{ .state = self.state, .predicate = matches };
+        /// Narrows what follows to the calls whose arguments `matcher` accepts: a function of the
+        /// arguments, or a matcher such as `argIs`.
+        pub fn with(self: Self, comptime matcher: anytype) Self {
+            return .{ .state = self.state, .predicate = predicate(Args, matcher) };
         }
 
         /// Answers the calls with `value`.
@@ -299,9 +329,11 @@ pub fn Received(comptime F: type) type {
         history: []const std.meta.ArgsTuple(F),
         overflowed: bool,
 
-        /// The calls whose arguments `matches` accepts. It sees the latest `history_len` calls,
-        /// and every verification of it fails once the slot was called more often than that.
-        pub fn where(self: Self, matches: *const fn (std.meta.ArgsTuple(F)) bool) Self {
+        /// The calls whose arguments `matcher` accepts: a function of the arguments, or a matcher
+        /// such as `argIs`. It sees the latest `history_len` calls, and every verification of it
+        /// fails once the slot was called more often than that.
+        pub fn where(self: Self, comptime matcher: anytype) Self {
+            const matches = predicate(std.meta.ArgsTuple(F), matcher);
             var picked = self;
             picked.overflowed = self.calls > history_len;
             picked.calls = 0;

@@ -169,7 +169,9 @@ test "a configuration narrowed by a predicate answers only the calls it accepts,
     defer dev.deinit();
     _ = dev.when(.create_buffer).returns(0);
     _ = dev.when(.create_buffer).with(large).returns(-1);
+    _ = dev.when(.create_buffer).with(zsub.argIs(1, @as(u64, 7))).returns(-2);
 
+    try testing.expectEqual(@as(c_int, -2), dev.api().create_buffer.?(dev.api(), 7, null));
     _ = try makeBuffer(dev.api(), 64);
     try testing.expectError(error.Refused, makeBuffer(dev.api(), 65));
     _ = dev.when(.create_buffer).returns(0);
@@ -267,6 +269,8 @@ test "calls are verified by their arguments, and a filter that cannot see every 
     try dev.received(.destroy_buffer).times(2);
     try dev.received(.destroy_buffer).where(valid).sameAs(dev.received(.create_buffer));
     try testing.expectEqual(buffer, dev.received(.destroy_buffer).where(valid).lastArgs().?[1]);
+    try dev.received(.destroy_buffer).where(zsub.argIsNot(1, @as(u64, 0))).times(1);
+    try dev.received(.destroy_buffer).where(zsub.argIs(1, @as(u64, 0))).times(1);
 
     for (0..zsub.history_len) |_| dev.api().destroy_buffer.?(dev.api(), 0);
     try dev.received(.destroy_buffer).times(zsub.history_len + 2);
