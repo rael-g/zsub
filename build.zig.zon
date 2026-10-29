@@ -1,0 +1,7 @@
+.{
+    .name = .zsub,
+    .version = "0.0.0",
+    .fingerprint = 0x8285c42a42b5c673,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE" },
+}
