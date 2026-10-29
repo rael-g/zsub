@@ -11,8 +11,17 @@ pub const default_capacity = 16;
 /// How many configurations one slot of a substitute can hold.
 pub const max_rules = 16;
 
-/// How many calls of one slot `where` can look back on.
-pub const history_len = 32;
+/// How many calls of one slot `where` can look back on, unless the options say otherwise.
+pub const default_history = 32;
+
+/// How a substitute is sized.
+pub const Options = struct {
+    /// How many substitutes of the table can be live at once when some of its slots have no way
+    /// back to their substitute.
+    capacity: usize = default_capacity,
+    /// How many calls of each slot `where` can look back on.
+    history: usize = default_history,
+};
 
 /// What `received` reports when a verification fails.
 pub const VerificationError = error{UnexpectedCalls};
@@ -69,6 +78,13 @@ pub fn For(comptime T: type) type {
 /// substitute's `context`; any other slot is served from a pool of `capacity` copies, so at most
 /// `capacity` substitutes of `T` can be live at once.
 pub fn ForN(comptime T: type, comptime capacity: usize) type {
+    return ForWith(T, .{ .capacity = capacity });
+}
+
+/// A substitute of `T` sized by `options`.
+pub fn ForWith(comptime T: type, comptime options: Options) type {
+    const capacity = options.capacity;
+    const history_len = options.history;
     const fields = @typeInfo(T).@"struct".fields;
     @setEvalBranchQuota(1000 + 100 * fields.len);
     comptime var needs_pool = false;
@@ -87,7 +103,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
         pub const Slot = std.meta.FieldEnum(T);
 
         table: T,
-        slots: States(T),
+        slots: States(T, history_len),
         fresh: u64,
         index: usize,
 
@@ -134,7 +150,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
 
         /// Configures what `slot` does when called. A later configuration takes precedence over
         /// an earlier one for the calls both match.
-        pub fn when(self: *Self, comptime slot: Slot) When(SlotFn(slot)) {
+        pub fn when(self: *Self, comptime slot: Slot) When(SlotFn(slot), history_len) {
             return .{ .state = &@field(self.slots, @tagName(slot)), .predicate = null };
         }
 
@@ -209,7 +225,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
             const at = sequence.fetchAdd(1, .acq_rel) + 1;
             const before = @atomicRmw(u32, &state.calls, .Add, 1, .acq_rel);
             if (before == 0) state.first_seq = at;
-            state.history[before % history_len] = args;
+            if (history_len > 0) state.history[before % history_len] = args;
             state.last_seq = at;
             state.last = args;
             if (state.fresh_out) |k| {
@@ -261,12 +277,12 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
 }
 
 /// The configuration of one slot of a substitute, returned by `when`.
-pub fn When(comptime F: type) type {
+pub fn When(comptime F: type, comptime history_len: usize) type {
     const R = Return(F);
     const Args = std.meta.ArgsTuple(F);
     return struct {
         const Self = @This();
-        state: *SlotState(F),
+        state: *SlotState(F, history_len),
         predicate: ?*const fn (Args) bool,
 
         /// Narrows what follows to the calls whose arguments `matcher` accepts: a function of the
@@ -332,7 +348,7 @@ pub fn When(comptime F: type) type {
             return self;
         }
 
-        fn add(self: Self, behavior: SlotState(F).Behavior) Self {
+        fn add(self: Self, behavior: SlotState(F, history_len).Behavior) Self {
             if (self.state.rule_count == max_rules) @panic("zsub: a slot holds at most " ++ std.fmt.comptimePrint("{d}", .{max_rules}) ++ " configurations");
             self.state.rules[self.state.rule_count] = .{ .predicate = self.predicate, .behavior = behavior };
             self.state.rule_count += 1;
@@ -354,12 +370,13 @@ pub fn Received(comptime F: type) type {
         overflowed: bool,
 
         /// The calls whose arguments `matcher` accepts: a function of the arguments, or a matcher
-        /// such as `argIs`. It sees the latest `history_len` calls, and every verification of it
+        /// such as `argIs`. It sees as many of the latest calls as the substitute's history holds,
+        /// and every verification of it
         /// fails once the slot was called more often than that.
         pub fn where(self: Self, comptime matcher: anytype) Self {
             const matches = predicate(std.meta.ArgsTuple(F), matcher);
             var picked = self;
-            picked.overflowed = self.calls > history_len;
+            picked.overflowed = self.calls > self.history.len;
             picked.calls = 0;
             picked.last = null;
             for (self.history) |args| {
@@ -396,7 +413,7 @@ pub fn Received(comptime F: type) type {
         }
 
         fn complete(self: Self) VerificationError!void {
-            if (self.overflowed) return fail(self.name, "called more than {d} times, so a filter by arguments cannot see every call", .{history_len});
+            if (self.overflowed) return fail(self.name, "called {d} times, more than the history holds, so a filter by arguments cannot see every call; raise it with zsub.ForWith", .{self.calls});
         }
 
         /// The arguments of the latest call, or null when the slot was never called.
@@ -411,7 +428,7 @@ fn fail(name: []const u8, comptime fmt: []const u8, args: anytype) VerificationE
     return error.UnexpectedCalls;
 }
 
-fn SlotState(comptime F: type) type {
+fn SlotState(comptime F: type, comptime history_len: usize) type {
     const R = Return(F);
     const Args = std.meta.ArgsTuple(F);
     return struct {
@@ -468,7 +485,7 @@ fn noOuts(comptime O: type) O {
     return o;
 }
 
-fn States(comptime T: type) type {
+fn States(comptime T: type, comptime history_len: usize) type {
     const fields = @typeInfo(T).@"struct".fields;
     @setEvalBranchQuota(1000 + 100 * fields.len);
     comptime var count = 0;
@@ -481,7 +498,7 @@ fn States(comptime T: type) type {
     for (fields) |f| {
         if (fnOf(f.type)) |F| {
             names[i] = f.name;
-            types[i] = SlotState(F);
+            types[i] = SlotState(F, history_len);
             i += 1;
         }
     }

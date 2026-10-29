@@ -272,8 +272,8 @@ test "calls are verified by their arguments, and a filter that cannot see every 
     try dev.received(.destroy_buffer).where(zsub.argIsNot(1, @as(u64, 0))).times(1);
     try dev.received(.destroy_buffer).where(zsub.argIs(1, @as(u64, 0))).times(1);
 
-    for (0..zsub.history_len) |_| dev.api().destroy_buffer.?(dev.api(), 0);
-    try dev.received(.destroy_buffer).times(zsub.history_len + 2);
+    for (0..zsub.default_history) |_| dev.api().destroy_buffer.?(dev.api(), 0);
+    try dev.received(.destroy_buffer).times(zsub.default_history + 2);
     try testing.expectError(error.UnexpectedCalls, dev.received(.destroy_buffer).where(valid).times(1));
 }
 
@@ -342,4 +342,13 @@ test "a slot writes a configured value through an out argument and answers from 
     try testing.expectEqual(@as(usize, 1), labels.count);
     try pass.received(.end).times(1);
     try enc.noUnconfiguredCalls();
+}
+
+test "a longer history lets a filter by arguments see every call" {
+    var dev: zsub.ForWith(Device, .{ .history = 256 }) = undefined;
+    try dev.init();
+    defer dev.deinit();
+
+    for (0..200) |i| dev.api().destroy_buffer.?(dev.api(), i % 2);
+    try dev.received(.destroy_buffer).where(zsub.argIs(1, 1)).times(100);
 }
