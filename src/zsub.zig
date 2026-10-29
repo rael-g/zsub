@@ -70,6 +70,7 @@ pub fn For(comptime T: type) type {
 /// `capacity` substitutes of `T` can be live at once.
 pub fn ForN(comptime T: type, comptime capacity: usize) type {
     const fields = @typeInfo(T).@"struct".fields;
+    @setEvalBranchQuota(1000 + 100 * fields.len);
     comptime var needs_pool = false;
     inline for (fields) |f| {
         if (fnOf(f.type)) |F| {
@@ -157,12 +158,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
 
         fn SlotFn(comptime slot: Slot) type {
             const name = @tagName(slot);
-            inline for (fields) |f| {
-                if (comptime std.mem.eql(u8, f.name, name)) {
-                    return fnOf(f.type) orelse @compileError("zsub: '" ++ name ++ "' of " ++ @typeName(T) ++ " is not a function pointer");
-                }
-            }
-            unreachable;
+            return fnOf(@FieldType(T, name)) orelse @compileError("zsub: '" ++ name ++ "' of " ++ @typeName(T) ++ " is not a function pointer");
         }
 
         fn claim(self: *Self) error{OutOfSubstitutes}!usize {
@@ -413,6 +409,7 @@ fn SlotState(comptime F: type) type {
 
 fn States(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
+    @setEvalBranchQuota(1000 + 100 * fields.len);
     comptime var count = 0;
     inline for (fields) |f| {
         if (fnOf(f.type) != null) count += 1;

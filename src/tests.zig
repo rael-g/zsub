@@ -276,3 +276,23 @@ test "calls are verified by their arguments, and a filter that cannot see every 
     try dev.received(.destroy_buffer).times(zsub.history_len + 2);
     try testing.expectError(error.UnexpectedCalls, dev.received(.destroy_buffer).where(valid).times(1));
 }
+
+const Large = blk: {
+    const count = 200;
+    @setEvalBranchQuota(100_000);
+    var names: [count][]const u8 = undefined;
+    for (&names, 0..) |*n, i| n.* = std.fmt.comptimePrint("slot{d}", .{i});
+    const Slot = ?*const fn (?*anyopaque, u32) callconv(.c) u32;
+    break :blk @Struct(.@"extern", null, &names, &@splat(Slot), &@splat(.{}));
+};
+
+test "a table with many slots is substituted" {
+    var many: zsub.For(Large) = undefined;
+    try many.init();
+    defer many.deinit();
+    _ = many.when(.slot199).returnsFresh();
+
+    try testing.expect(many.api().slot199.?(many.context(), 1) != 0);
+    try many.received(.slot199).times(1);
+    try many.received(.slot0).never();
+}
