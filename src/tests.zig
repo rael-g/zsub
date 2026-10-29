@@ -230,3 +230,23 @@ test "calls across substitutes are verified in order" {
     try testing.expectError(error.UnexpectedCalls, zsub.inOrder(.{ b.received(.destroy_buffer), a.received(.create_buffer) }));
     try testing.expectError(error.UnexpectedCalls, zsub.inOrder(.{ a.received(.create_buffer), a.received(.name) }));
 }
+
+const Registry = extern struct {
+    id: ?*const fn (?*Registry, name: [*c]const u8) callconv(.c) u32 = null,
+    make: ?*const fn (?*Registry, out: ?*u32) callconv(.c) c_int = null,
+};
+
+test "fresh values answered and written by one substitute never repeat" {
+    var reg: zsub.For(Registry) = undefined;
+    try reg.init();
+    defer reg.deinit();
+    _ = reg.when(.id).returnsFresh();
+    _ = reg.when(.make).writesFresh(1);
+
+    var made: u32 = 0;
+    const a = reg.api().id.?(reg.api(), "a");
+    _ = reg.api().make.?(reg.api(), &made);
+    const b = reg.api().id.?(reg.api(), "a");
+    try testing.expect(a != 0 and made != 0 and b != 0);
+    try testing.expect(a != made and made != b and a != b);
+}

@@ -197,6 +197,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
                 }
                 return switch (rule.behavior) {
                     .value => |v| v,
+                    .fresh => freshOf(Return(F), self.nextFresh()),
                     .does => |f| f(args),
                     .sequence => |*seq| blk: {
                         const v = seq.values[seq.next];
@@ -210,8 +211,12 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
         }
 
         fn writeFresh(self: *Self, out: anytype) void {
-            const value = @atomicRmw(u64, &self.fresh, .Add, 1, .acq_rel) + 1;
+            const value = self.nextFresh();
             if (toPtr(Pointee(@TypeOf(out)), out)) |p| p.* = @intCast(value);
+        }
+
+        fn nextFresh(self: *Self) u64 {
+            return @atomicRmw(u64, &self.fresh, .Add, 1, .acq_rel) + 1;
         }
     };
 }
@@ -244,6 +249,13 @@ pub fn When(comptime F: type) type {
         /// `values` must outlive the substitute and hold at least one value.
         pub fn returnsSeq(self: Self, values: []const R) Self {
             return self.add(.{ .sequence = .{ .values = values, .next = 0 } });
+        }
+
+        /// Answers each call with a value no earlier call of this substitute answered or wrote.
+        /// Only for a slot that returns an integer.
+        pub fn returnsFresh(self: Self) Self {
+            if (comptime @typeInfo(R) != .int) @compileError("zsub: returnsFresh is only for a slot that returns an integer, not " ++ @typeName(R));
+            return self.add(.fresh);
         }
 
         /// Answers each call with what `f` returns for the call's arguments.
@@ -317,6 +329,7 @@ fn SlotState(comptime F: type) type {
     return struct {
         const Behavior = union(enum) {
             value: R,
+            fresh,
             does: *const fn (Args) R,
             sequence: struct { values: []const R, next: usize },
         };
@@ -418,6 +431,13 @@ fn Pointee(comptime P: type) type {
 fn toPtr(comptime Child: type, p: anytype) ?*Child {
     const address = @intFromPtr(p);
     return if (address == 0) null else @ptrFromInt(address);
+}
+
+fn freshOf(comptime R: type, value: u64) R {
+    return switch (@typeInfo(R)) {
+        .int => @intCast(value),
+        else => unreachable,
+    };
 }
 
 fn zeroOf(comptime R: type) R {
