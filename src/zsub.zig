@@ -219,6 +219,13 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
                     }
                 }
             }
+            inline for (args, 0..) |arg, k| {
+                if (comptime @TypeOf(state.outs[k]) != void) {
+                    if (state.outs[k]) |value| {
+                        if (toPtr(Pointee(@TypeOf(arg)), arg)) |p| p.* = value;
+                    }
+                }
+            }
             var i = state.rule_count;
             while (i > 0) {
                 i -= 1;
@@ -230,6 +237,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
                     .value => |v| v,
                     .fresh => freshOf(Return(F), self.nextFresh()),
                     .does => |f| f(args),
+                    .does_with => |d| d.call(d.ctx, args),
                     .sequence => |*seq| blk: {
                         const v = seq.values[seq.next];
                         if (seq.next + 1 < seq.values.len) seq.next += 1;
@@ -237,7 +245,7 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
                     },
                 };
             }
-            if (state.fresh_out == null) _ = @atomicRmw(u32, &state.unconfigured, .Add, 1, .acq_rel);
+            if (state.fresh_out == null and !state.writes_out) _ = @atomicRmw(u32, &state.unconfigured, .Add, 1, .acq_rel);
             return zeroOf(Return(F));
         }
 
@@ -293,6 +301,26 @@ pub fn When(comptime F: type) type {
         /// Answers each call with what `f` returns for the call's arguments.
         pub fn does(self: Self, f: *const fn (Args) R) Self {
             return self.add(.{ .does = f });
+        }
+
+        /// Answers each call with what `f` returns for `ctx` and the call's arguments, so the
+        /// answer can read and change state the test owns. `ctx` must outlive the substitute.
+        pub fn doesWith(self: Self, ctx: anytype, comptime f: fn (@TypeOf(ctx), Args) R) Self {
+            const Ctx = @TypeOf(ctx);
+            const call = struct {
+                fn call(erased: *anyopaque, args: Args) R {
+                    return f(@as(Ctx, @ptrCast(@alignCast(erased))), args);
+                }
+            }.call;
+            return self.add(.{ .does_with = .{ .ctx = @ptrCast(@constCast(ctx)), .call = call } });
+        }
+
+        /// Writes `value` through argument `k`, a pointer the slot writes its result through, on
+        /// every call of the slot.
+        pub fn writes(self: Self, comptime k: usize, value: OutOf(F, k)) Self {
+            self.state.outs[k] = value;
+            self.state.writes_out = true;
+            return self;
         }
 
         /// Writes a value no earlier call of this substitute wrote through argument `k`, which
@@ -391,6 +419,7 @@ fn SlotState(comptime F: type) type {
             value: R,
             fresh,
             does: *const fn (Args) R,
+            does_with: struct { ctx: *anyopaque, call: *const fn (*anyopaque, Args) R },
             sequence: struct { values: []const R, next: usize },
         };
         const Rule = struct { predicate: ?*const fn (Args) bool, behavior: Behavior };
@@ -402,9 +431,41 @@ fn SlotState(comptime F: type) type {
         last: ?Args = null,
         history: [history_len]Args = undefined,
         fresh_out: ?usize = null,
+        outs: Outs(F) = noOuts(Outs(F)),
+        writes_out: bool = false,
         rules: [max_rules]Rule = undefined,
         rule_count: usize = 0,
     };
+}
+
+fn OutOf(comptime F: type, comptime k: usize) type {
+    const params = @typeInfo(F).@"fn".params;
+    if (k >= params.len) @compileError("zsub: the slot has no argument " ++ std.fmt.comptimePrint("{d}", .{k}));
+    return OutPointee(params[k].type.?) orelse @compileError("zsub: argument " ++ std.fmt.comptimePrint("{d}", .{k}) ++ " is not a pointer the slot can write through");
+}
+
+fn OutPointee(comptime P: type) ?type {
+    const Ptr = switch (@typeInfo(P)) {
+        .optional => |o| o.child,
+        else => P,
+    };
+    return switch (@typeInfo(Ptr)) {
+        .pointer => |p| if (!p.is_const and (p.size == .one or p.size == .c) and p.child != anyopaque and @typeInfo(p.child) != .@"fn" and @typeInfo(p.child) != .@"opaque") p.child else null,
+        else => null,
+    };
+}
+
+fn Outs(comptime F: type) type {
+    const params = @typeInfo(F).@"fn".params;
+    var types: [params.len]type = undefined;
+    for (params, &types) |p, *t| t.* = if (OutPointee(p.type.?)) |V| ?V else void;
+    return @Tuple(&types);
+}
+
+fn noOuts(comptime O: type) O {
+    var o: O = undefined;
+    inline for (@typeInfo(O).@"struct".fields) |f| @field(o, f.name) = if (f.type == void) {} else null;
+    return o;
 }
 
 fn States(comptime T: type) type {

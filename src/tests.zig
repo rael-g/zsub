@@ -296,3 +296,50 @@ test "a table with many slots is substituted" {
     try many.received(.slot199).times(1);
     try many.received(.slot0).never();
 }
+
+const Pass = extern struct {
+    end: ?*const fn (?*Pass) callconv(.c) void = null,
+};
+
+const PassHandle = extern struct {
+    ref: ?*Pass,
+    destroy: ?*const fn (?*Pass) callconv(.c) void,
+};
+
+const Encoder = extern struct {
+    begin: ?*const fn (?*Encoder, label: [*c]const u8, out: ?*PassHandle) callconv(.c) c_int = null,
+};
+
+const Labels = struct {
+    seen: [4][8]u8 = undefined,
+    count: usize = 0,
+
+    fn record(self: *Labels, args: zsub.For(Encoder).Args(.begin)) c_int {
+        const label = std.mem.span(args[1]);
+        @memcpy(self.seen[self.count][0..label.len], label);
+        self.count += 1;
+        return 0;
+    }
+};
+
+test "a slot writes a configured value through an out argument and answers from state the test owns" {
+    var pass: zsub.For(Pass) = undefined;
+    try pass.init();
+    defer pass.deinit();
+    var enc: zsub.For(Encoder) = undefined;
+    try enc.init();
+    defer enc.deinit();
+    var labels: Labels = .{};
+    _ = enc.when(.begin).writes(2, .{ .ref = pass.api(), .destroy = null }).doesWith(&labels, Labels.record);
+
+    var buf: [8]u8 = "first\x00\x00\x00".*;
+    var handle: PassHandle = .{ .ref = null, .destroy = null };
+    try testing.expectEqual(@as(c_int, 0), enc.api().begin.?(enc.api(), &buf, &handle));
+    @memcpy(buf[0..6], "other\x00");
+    handle.ref.?.end.?(handle.ref);
+
+    try testing.expectEqualStrings("first", labels.seen[0][0..5]);
+    try testing.expectEqual(@as(usize, 1), labels.count);
+    try pass.received(.end).times(1);
+    try enc.noUnconfiguredCalls();
+}
