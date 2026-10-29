@@ -250,3 +250,25 @@ test "fresh values answered and written by one substitute never repeat" {
     try testing.expect(a != 0 and made != 0 and b != 0);
     try testing.expect(a != made and made != b and a != b);
 }
+
+fn valid(args: DeviceSub.Args(.destroy_buffer)) bool {
+    return args[1] != 0;
+}
+
+test "calls are verified by their arguments, and a filter that cannot see every call fails" {
+    var dev: DeviceSub = undefined;
+    try dev.init();
+    defer dev.deinit();
+    _ = dev.when(.create_buffer).writesFresh(2);
+
+    dev.api().destroy_buffer.?(dev.api(), 0);
+    const buffer = try makeBuffer(dev.api(), 1);
+    dev.api().destroy_buffer.?(dev.api(), buffer);
+    try dev.received(.destroy_buffer).times(2);
+    try dev.received(.destroy_buffer).where(valid).sameAs(dev.received(.create_buffer));
+    try testing.expectEqual(buffer, dev.received(.destroy_buffer).where(valid).lastArgs().?[1]);
+
+    for (0..zsub.history_len) |_| dev.api().destroy_buffer.?(dev.api(), 0);
+    try dev.received(.destroy_buffer).times(zsub.history_len + 2);
+    try testing.expectError(error.UnexpectedCalls, dev.received(.destroy_buffer).where(valid).times(1));
+}

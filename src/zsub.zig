@@ -11,6 +11,9 @@ pub const default_capacity = 16;
 /// How many configurations one slot of a substitute can hold.
 pub const max_rules = 16;
 
+/// How many calls of one slot `where` can look back on.
+pub const history_len = 32;
+
 /// What `received` reports when a verification fails.
 pub const VerificationError = error{UnexpectedCalls};
 
@@ -119,7 +122,8 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
         /// What `slot` has received so far.
         pub fn received(self: *Self, comptime slot: Slot) Received(SlotFn(slot)) {
             const state = &@field(self.slots, @tagName(slot));
-            return .{ .name = @tagName(slot), .calls = @atomicLoad(u32, &state.calls, .acquire), .last = state.last, .first_seq = state.first_seq, .last_seq = state.last_seq };
+            const calls = @atomicLoad(u32, &state.calls, .acquire);
+            return .{ .name = @tagName(slot), .calls = calls, .last = state.last, .first_seq = state.first_seq, .last_seq = state.last_seq, .history = state.history[0..@min(calls, history_len)], .overflowed = false };
         }
 
         fn SlotFn(comptime slot: Slot) type {
@@ -178,7 +182,9 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
         fn dispatch(self: *Self, comptime name: []const u8, comptime F: type, args: std.meta.ArgsTuple(F)) Return(F) {
             const state = &@field(self.slots, name);
             const at = sequence.fetchAdd(1, .acq_rel) + 1;
-            if (@atomicRmw(u32, &state.calls, .Add, 1, .acq_rel) == 0) state.first_seq = at;
+            const before = @atomicRmw(u32, &state.calls, .Add, 1, .acq_rel);
+            if (before == 0) state.first_seq = at;
+            state.history[before % history_len] = args;
             state.last_seq = at;
             state.last = args;
             if (state.fresh_out) |k| {
@@ -290,9 +296,28 @@ pub fn Received(comptime F: type) type {
         last: ?std.meta.ArgsTuple(F),
         first_seq: u64,
         last_seq: u64,
+        history: []const std.meta.ArgsTuple(F),
+        overflowed: bool,
+
+        /// The calls whose arguments `matches` accepts. It sees the latest `history_len` calls,
+        /// and every verification of it fails once the slot was called more often than that.
+        pub fn where(self: Self, matches: *const fn (std.meta.ArgsTuple(F)) bool) Self {
+            var picked = self;
+            picked.overflowed = self.calls > history_len;
+            picked.calls = 0;
+            picked.last = null;
+            for (self.history) |args| {
+                if (matches(args)) {
+                    picked.calls += 1;
+                    picked.last = args;
+                }
+            }
+            return picked;
+        }
 
         /// Fails unless the slot was called exactly `n` times.
         pub fn times(self: Self, n: u32) VerificationError!void {
+            try self.complete();
             if (self.calls != n) return fail(self.name, "{d} calls expected, {d} received", .{ n, self.calls });
         }
 
@@ -303,12 +328,19 @@ pub fn Received(comptime F: type) type {
 
         /// Fails unless the slot was called at least `n` times.
         pub fn atLeast(self: Self, n: u32) VerificationError!void {
+            try self.complete();
             if (self.calls < n) return fail(self.name, "at least {d} calls expected, {d} received", .{ n, self.calls });
         }
 
         /// Fails unless the slot was called as many times as `other`.
         pub fn sameAs(self: Self, other: anytype) VerificationError!void {
+            try self.complete();
+            try other.complete();
             if (self.calls != other.calls) return fail(self.name, "as many calls as '{s}' expected: {d} against {d}", .{ other.name, self.calls, other.calls });
+        }
+
+        fn complete(self: Self) VerificationError!void {
+            if (self.overflowed) return fail(self.name, "called more than {d} times, so a filter by arguments cannot see every call", .{history_len});
         }
 
         /// The arguments of the latest call, or null when the slot was never called.
@@ -340,6 +372,7 @@ fn SlotState(comptime F: type) type {
         last_seq: u64 = 0,
         unconfigured: u32 = 0,
         last: ?Args = null,
+        history: [history_len]Args = undefined,
         fresh_out: ?usize = null,
         rules: [max_rules]Rule = undefined,
         rule_count: usize = 0,
