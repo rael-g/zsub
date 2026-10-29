@@ -8,8 +8,24 @@ const std = @import("std");
 /// to their substitute.
 pub const default_capacity = 16;
 
+/// How many configurations one slot of a substitute can hold.
+pub const max_rules = 16;
+
 /// What `received` reports when a verification fails.
 pub const VerificationError = error{UnexpectedCalls};
+
+var sequence: std.atomic.Value(u64) = .init(0);
+
+/// Fails unless every slot in `slots`, a tuple of `received` reports, was called, and each one's
+/// calls all came before the first call of the one after it.
+pub fn inOrder(slots: anytype) VerificationError!void {
+    inline for (slots) |r| {
+        if (r.calls == 0) return fail(r.name, "a call was expected in order, none received", .{});
+    }
+    inline for (1..slots.len) |i| {
+        if (slots[i - 1].last_seq > slots[i].first_seq) return fail(slots[i].name, "was called before the latest call of '{s}'", .{slots[i - 1].name});
+    }
+}
 
 /// A substitute of `T` with the default capacity.
 pub fn For(comptime T: type) type {
@@ -78,15 +94,32 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
             return self;
         }
 
-        /// Configures what `slot` does when called.
+        /// The tuple of the arguments `slot` is called with.
+        pub fn Args(comptime slot: Slot) type {
+            return std.meta.ArgsTuple(SlotFn(slot));
+        }
+
+        /// Configures what `slot` does when called. A later configuration takes precedence over
+        /// an earlier one for the calls both match.
         pub fn when(self: *Self, comptime slot: Slot) When(SlotFn(slot)) {
-            return .{ .state = &@field(self.slots, @tagName(slot)) };
+            return .{ .state = &@field(self.slots, @tagName(slot)), .predicate = null };
+        }
+
+        /// Fails if a slot was called with no configuration matching the call.
+        pub fn noUnconfiguredCalls(self: *Self) VerificationError!void {
+            inline for (fields) |f| {
+                if (comptime fnOf(f.type) != null) {
+                    const state = &@field(self.slots, f.name);
+                    const n = @atomicLoad(u32, &state.unconfigured, .acquire);
+                    if (n > 0) return fail(f.name, "{d} calls matched no configuration", .{n});
+                }
+            }
         }
 
         /// What `slot` has received so far.
         pub fn received(self: *Self, comptime slot: Slot) Received(SlotFn(slot)) {
             const state = &@field(self.slots, @tagName(slot));
-            return .{ .name = @tagName(slot), .calls = @atomicLoad(u32, &state.calls, .acquire), .last = state.last };
+            return .{ .name = @tagName(slot), .calls = @atomicLoad(u32, &state.calls, .acquire), .last = state.last, .first_seq = state.first_seq, .last_seq = state.last_seq };
         }
 
         fn SlotFn(comptime slot: Slot) type {
@@ -144,7 +177,9 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
 
         fn dispatch(self: *Self, comptime name: []const u8, comptime F: type, args: std.meta.ArgsTuple(F)) Return(F) {
             const state = &@field(self.slots, name);
-            _ = @atomicRmw(u32, &state.calls, .Add, 1, .acq_rel);
+            const at = sequence.fetchAdd(1, .acq_rel) + 1;
+            if (@atomicRmw(u32, &state.calls, .Add, 1, .acq_rel) == 0) state.first_seq = at;
+            state.last_seq = at;
             state.last = args;
             if (state.fresh_out) |k| {
                 inline for (args, 0..) |arg, i| {
@@ -153,16 +188,25 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
                     }
                 }
             }
-            return switch (state.behavior) {
-                .zero => zeroOf(Return(F)),
-                .value => |v| v,
-                .does => |f| f(args),
-                .sequence => |*seq| blk: {
-                    const v = seq.values[seq.next];
-                    if (seq.next + 1 < seq.values.len) seq.next += 1;
-                    break :blk v;
-                },
-            };
+            var i = state.rule_count;
+            while (i > 0) {
+                i -= 1;
+                const rule = &state.rules[i];
+                if (rule.predicate) |matches| {
+                    if (!matches(args)) continue;
+                }
+                return switch (rule.behavior) {
+                    .value => |v| v,
+                    .does => |f| f(args),
+                    .sequence => |*seq| blk: {
+                        const v = seq.values[seq.next];
+                        if (seq.next + 1 < seq.values.len) seq.next += 1;
+                        break :blk v;
+                    },
+                };
+            }
+            if (state.fresh_out == null) _ = @atomicRmw(u32, &state.unconfigured, .Add, 1, .acq_rel);
+            return zeroOf(Return(F));
         }
 
         fn writeFresh(self: *Self, out: anytype) void {
@@ -174,35 +218,52 @@ pub fn ForN(comptime T: type, comptime capacity: usize) type {
 
 /// The configuration of one slot of a substitute, returned by `when`.
 pub fn When(comptime F: type) type {
+    const R = Return(F);
+    const Args = std.meta.ArgsTuple(F);
     return struct {
         const Self = @This();
         state: *SlotState(F),
+        predicate: ?*const fn (Args) bool,
 
-        /// Answers every call with `value`.
-        pub fn returns(self: Self, value: Return(F)) Self {
-            self.state.behavior = .{ .value = value };
-            return self;
+        /// Narrows what follows to the calls whose arguments `matches` accepts.
+        pub fn with(self: Self, matches: *const fn (Args) bool) Self {
+            return .{ .state = self.state, .predicate = matches };
+        }
+
+        /// Answers the calls with `value`.
+        pub fn returns(self: Self, value: R) Self {
+            return self.add(.{ .value = value });
+        }
+
+        /// Answers the calls with the error `err`. Only for a slot that returns an error union.
+        pub fn fails(self: Self, err: ErrorOf(R)) Self {
+            return self.add(.{ .value = err });
         }
 
         /// Answers each call with the next of `values`, repeating the last one once they run out.
         /// `values` must outlive the substitute and hold at least one value.
-        pub fn returnsSeq(self: Self, values: []const Return(F)) Self {
-            self.state.behavior = .{ .sequence = .{ .values = values, .next = 0 } };
-            return self;
+        pub fn returnsSeq(self: Self, values: []const R) Self {
+            return self.add(.{ .sequence = .{ .values = values, .next = 0 } });
         }
 
         /// Answers each call with what `f` returns for the call's arguments.
-        pub fn does(self: Self, f: *const fn (std.meta.ArgsTuple(F)) Return(F)) Self {
-            self.state.behavior = .{ .does = f };
-            return self;
+        pub fn does(self: Self, f: *const fn (Args) R) Self {
+            return self.add(.{ .does = f });
         }
 
         /// Writes a value no earlier call of this substitute wrote through argument `k`, which
-        /// must be a pointer to an integer.
+        /// must be a pointer to an integer, on every call of the slot.
         pub fn writesFresh(self: Self, comptime k: usize) Self {
             const params = @typeInfo(F).@"fn".params;
             if (comptime (k >= params.len or !isIntOut(params[k].type.?))) @compileError("zsub: argument " ++ std.fmt.comptimePrint("{d}", .{k}) ++ " is not a pointer to an integer");
             self.state.fresh_out = k;
+            return self;
+        }
+
+        fn add(self: Self, behavior: SlotState(F).Behavior) Self {
+            if (self.state.rule_count == max_rules) @panic("zsub: a slot holds at most " ++ std.fmt.comptimePrint("{d}", .{max_rules}) ++ " configurations");
+            self.state.rules[self.state.rule_count] = .{ .predicate = self.predicate, .behavior = behavior };
+            self.state.rule_count += 1;
             return self;
         }
     };
@@ -215,6 +276,8 @@ pub fn Received(comptime F: type) type {
         name: []const u8,
         calls: u32,
         last: ?std.meta.ArgsTuple(F),
+        first_seq: u64,
+        last_seq: u64,
 
         /// Fails unless the slot was called exactly `n` times.
         pub fn times(self: Self, n: u32) VerificationError!void {
@@ -252,15 +315,21 @@ fn SlotState(comptime F: type) type {
     const R = Return(F);
     const Args = std.meta.ArgsTuple(F);
     return struct {
-        calls: u32 = 0,
-        last: ?Args = null,
-        fresh_out: ?usize = null,
-        behavior: union(enum) {
-            zero,
+        const Behavior = union(enum) {
             value: R,
             does: *const fn (Args) R,
             sequence: struct { values: []const R, next: usize },
-        } = .zero,
+        };
+        const Rule = struct { predicate: ?*const fn (Args) bool, behavior: Behavior };
+
+        calls: u32 = 0,
+        first_seq: u64 = 0,
+        last_seq: u64 = 0,
+        unconfigured: u32 = 0,
+        last: ?Args = null,
+        fresh_out: ?usize = null,
+        rules: [max_rules]Rule = undefined,
+        rule_count: usize = 0,
     };
 }
 
@@ -313,6 +382,13 @@ fn fnOf(comptime P: type) ?type {
     return switch (@typeInfo(Ptr)) {
         .pointer => |p| if (@typeInfo(p.child) == .@"fn") p.child else null,
         else => null,
+    };
+}
+
+fn ErrorOf(comptime R: type) type {
+    return switch (@typeInfo(R)) {
+        .error_union => |e| e.error_set,
+        else => @compileError("zsub: fails is only for a slot that returns an error union, not " ++ @typeName(R)),
     };
 }
 
@@ -407,7 +483,127 @@ fn forward(comptime F: type, comptime call: anytype) *const F {
                 return call(.{ a0, a1, a2, a3, a4, a5, a6, a7 });
             }
         }.f,
-        else => @compileError("zsub: slots with more than 8 parameters are not supported yet"),
+        9 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8 });
+            }
+        }.f,
+        10 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 });
+            }
+        }.f,
+        11 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 });
+            }
+        }.f,
+        12 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 });
+            }
+        }.f,
+        13 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 });
+            }
+        }.f,
+        14 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13 });
+            }
+        }.f,
+        15 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14 });
+            }
+        }.f,
+        16 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 });
+            }
+        }.f,
+        17 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16 });
+            }
+        }.f,
+        18 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17 });
+            }
+        }.f,
+        19 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18 });
+            }
+        }.f,
+        20 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19 });
+            }
+        }.f,
+        21 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20 });
+            }
+        }.f,
+        22 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21 });
+            }
+        }.f,
+        23 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22 });
+            }
+        }.f,
+        24 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23 });
+            }
+        }.f,
+        25 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24 });
+            }
+        }.f,
+        26 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25 });
+            }
+        }.f,
+        27 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?, a26: P[26].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26 });
+            }
+        }.f,
+        28 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?, a26: P[26].type.?, a27: P[27].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27 });
+            }
+        }.f,
+        29 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?, a26: P[26].type.?, a27: P[27].type.?, a28: P[28].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28 });
+            }
+        }.f,
+        30 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?, a26: P[26].type.?, a27: P[27].type.?, a28: P[28].type.?, a29: P[29].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29 });
+            }
+        }.f,
+        31 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?, a26: P[26].type.?, a27: P[27].type.?, a28: P[28].type.?, a29: P[29].type.?, a30: P[30].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30 });
+            }
+        }.f,
+        32 => &struct {
+            fn f(a0: P[0].type.?, a1: P[1].type.?, a2: P[2].type.?, a3: P[3].type.?, a4: P[4].type.?, a5: P[5].type.?, a6: P[6].type.?, a7: P[7].type.?, a8: P[8].type.?, a9: P[9].type.?, a10: P[10].type.?, a11: P[11].type.?, a12: P[12].type.?, a13: P[13].type.?, a14: P[14].type.?, a15: P[15].type.?, a16: P[16].type.?, a17: P[17].type.?, a18: P[18].type.?, a19: P[19].type.?, a20: P[20].type.?, a21: P[21].type.?, a22: P[22].type.?, a23: P[23].type.?, a24: P[24].type.?, a25: P[25].type.?, a26: P[26].type.?, a27: P[27].type.?, a28: P[28].type.?, a29: P[29].type.?, a30: P[30].type.?, a31: P[31].type.?) callconv(cc) R {
+                return call(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31 });
+            }
+        }.f,
+        else => @compileError("zsub: slots with more than 32 parameters are not supported"),
     };
 }
 

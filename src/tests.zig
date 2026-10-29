@@ -56,7 +56,9 @@ test "a sequence is returned in order and its last value repeats" {
     try testing.expectError(error.Refused, makeBuffer(dev.api(), 1));
 }
 
-fn refuseLarge(args: std.meta.Tuple(&.{ ?*Device, u64, ?*u64 })) c_int {
+const DeviceSub = zsub.For(Device);
+
+fn refuseLarge(args: DeviceSub.Args(.create_buffer)) c_int {
     return if (args[1] > 64) -1 else 0;
 }
 
@@ -136,7 +138,7 @@ test "a table with no way back refuses a substitute past its capacity and takes 
     subs[1].deinit();
 }
 
-fn grant(args: std.meta.ArgsTuple(@typeInfo(@FieldType(std.mem.Allocator.VTable, "alloc")).pointer.child)) ?[*]u8 {
+fn grant(args: zsub.For(std.mem.Allocator.VTable).Args(.alloc)) ?[*]u8 {
     _ = args;
     return &granted;
 }
@@ -155,4 +157,76 @@ test "a standard library interface is substituted through its context" {
     try testing.expectEqual(@as([*]u8, &granted), bytes.ptr);
     try vtable.received(.alloc).times(2);
     try testing.expectEqual(@as(usize, 8), vtable.received(.alloc).lastArgs().?[1]);
+}
+
+fn large(args: DeviceSub.Args(.create_buffer)) bool {
+    return args[1] > 64;
+}
+
+test "a configuration narrowed by a predicate answers only the calls it accepts, and the latest wins" {
+    var dev: DeviceSub = undefined;
+    try dev.init();
+    defer dev.deinit();
+    _ = dev.when(.create_buffer).returns(0);
+    _ = dev.when(.create_buffer).with(large).returns(-1);
+
+    _ = try makeBuffer(dev.api(), 64);
+    try testing.expectError(error.Refused, makeBuffer(dev.api(), 65));
+    _ = dev.when(.create_buffer).returns(0);
+    _ = try makeBuffer(dev.api(), 65);
+}
+
+test "calls that match no configuration are reported" {
+    var dev: DeviceSub = undefined;
+    try dev.init();
+    defer dev.deinit();
+    _ = dev.when(.create_buffer).with(large).returns(-1);
+
+    try testing.expectError(error.Refused, makeBuffer(dev.api(), 65));
+    try dev.noUnconfiguredCalls();
+    _ = try makeBuffer(dev.api(), 1);
+    try testing.expectError(error.UnexpectedCalls, dev.noUnconfiguredCalls());
+}
+
+const Store = struct {
+    load: *const fn (key: u32) error{Missing}!u32,
+};
+
+test "a slot returning an error union can be made to fail" {
+    var store: zsub.For(Store) = undefined;
+    try store.init();
+    defer store.deinit();
+
+    try testing.expectEqual(@as(u32, 0), try store.api().load(1));
+    _ = store.when(.load).fails(error.Missing);
+    try testing.expectError(error.Missing, store.api().load(1));
+}
+
+const Wide = extern struct {
+    call: ?*const fn (?*Wide, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) callconv(.c) u32 = null,
+};
+
+test "a slot with many parameters is substituted" {
+    var wide: zsub.For(Wide) = undefined;
+    try wide.init();
+    defer wide.deinit();
+    _ = wide.when(.call).returns(9);
+
+    try testing.expectEqual(@as(u32, 9), wide.api().call.?(wide.api(), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12));
+    try testing.expectEqual(@as(u8, 12), wide.received(.call).lastArgs().?[12]);
+}
+
+test "calls across substitutes are verified in order" {
+    var a: DeviceSub = undefined;
+    try a.init();
+    defer a.deinit();
+    var b: DeviceSub = undefined;
+    try b.init();
+    defer b.deinit();
+
+    _ = try makeBuffer(a.api(), 1);
+    b.api().destroy_buffer.?(b.api(), 1);
+    try zsub.inOrder(.{ a.received(.create_buffer), b.received(.destroy_buffer) });
+    try testing.expectError(error.UnexpectedCalls, zsub.inOrder(.{ b.received(.destroy_buffer), a.received(.create_buffer) }));
+    try testing.expectError(error.UnexpectedCalls, zsub.inOrder(.{ a.received(.create_buffer), a.received(.name) }));
 }
